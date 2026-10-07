@@ -15,4 +15,5 @@
 
 """Experimental PCA-based attention head dimensionality reduction."""
 
+from .adapters import *
 from .projection import *

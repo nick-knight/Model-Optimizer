@@ -12,9 +12,10 @@ The first vertical slice provides:
 - exact sample-weighted accumulation of per-head `E[xx^T]` statistics;
 - batched eigendecomposition with principal components ordered by decreasing eigenvalue;
 - different retained ranks for every head; and
-- frozen projection/reconstruction modules for compression-aware training.
+- frozen projection/reconstruction modules for compression-aware training; and
+- adapters for flattened Hugging Face-style key/value linear projections.
 
-Sensitivity-based rank allocation, model adapters, distillation examples, and weight absorption are
+Sensitivity-based rank allocation, architecture-specific orchestration, and weight absorption are
 planned next. The API is experimental and may change.
 
 ## Model Support
@@ -22,8 +23,8 @@ planned next. The API is experimental and may change.
 | Model/framework | Supported | Notes |
 | --- | --- | --- |
 | PyTorch attention implementations | Partial | Core operations work with any explicit head axis |
-| Bumblebee toy Transformer | Planned | Initial end-to-end integration target |
-| Hugging Face Transformers | Planned | Architecture adapters are not implemented |
+| Bumblebee toy Transformer | Yes | End-to-end research integration in Pulsar |
+| Hugging Face Transformers | Partial | Flattened K/V linear-output adapter; tested with Nemotron-H |
 | Megatron-Core | Planned | Architecture adapters are not implemented |
 
 ## Deployment
