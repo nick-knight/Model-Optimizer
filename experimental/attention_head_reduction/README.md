@@ -1,18 +1,19 @@
 # Attention Head Dimensionality Reduction
 
 This research prototype reduces the key and value feature dimensions independently for each
-attention head. It follows ESPACE's activation-centric approach: calibrate static principal
-subspaces from uncentered activation second moments, emulate the lossy projection while healing a
-student model, and absorb the frozen projections into attention weights for deployment.
+attention head. It supports activation-MSE PCA and a gradient-weighted squared-loss-gap objective,
+emulates the lossy projection while healing a student model, and is intended to absorb the frozen
+low-rank maps into attention weights for deployment.
 
 ## Status
 
 The first vertical slice provides:
 
 - exact sample-weighted accumulation of per-head `E[xx^T]` statistics;
+- paired accumulation of per-head activation and loss-gradient second moments;
 - batched eigendecomposition with principal components ordered by decreasing eigenvalue;
 - different retained ranks for every head; and
-- frozen projection/reconstruction modules for compression-aware training; and
+- frozen orthogonal or oblique projection/reconstruction modules for compression-aware training;
 - adapters for flattened Hugging Face-style key/value linear projections.
 
 Sensitivity-based rank allocation, architecture-specific orchestration, and weight absorption are
@@ -54,10 +55,47 @@ minimum-MSE construction, which uses the eigenspace of the uncentered autocorrel
 Projection matrices are PyTorch buffers rather than parameters, so gradients flow through the
 approximation while the calibrated subspaces remain fixed.
 
-For a basis `P_k` with orthonormal columns, key reconstruction changes the score to
-`q^T P_k P_k^T k`. Deployment can therefore replace both query and key coordinates with
-`q' = P_k^T q` and `k' = P_k^T k`. Likewise, value reconstruction can be absorbed with
-`v' = P_v^T v` and `W_O' = W_O P_v`.
+For the squared-loss-gap objective, calibration additionally accumulates `G = E[gg^T]`, where
+`g` is the loss gradient with respect to the activation. Under a K-FAC factorization, the local
+first-order objective for reconstruction `M` is
+
+```text
+tr(G (I - M) E[xx^T] (I - M)^T).
+```
+
+The implementation performs PCA on `G^(1/2) E[xx^T] G^(1/2)`. Its compression and reconstruction
+bases are distinct and implement a projection that is orthogonal in the damped gradient metric,
+but generally oblique in Euclidean coordinates:
+
+```python
+from experimental.attention_head_reduction import (
+    ActivationGradientCalibration,
+    HeadProjector,
+)
+
+calibration = ActivationGradientCalibration(num_heads=8, head_dim=64)
+outputs = model_with_calibration(inputs)
+loss = criterion(outputs, targets)
+loss.backward()
+activation_moment, gradient_moment = calibration.compute()
+projector = HeadProjector.from_squared_loss_gap(
+    activation_moment,
+    gradient_moment,
+    ranks=[32] * 8,
+)
+```
+
+For packed next-token calibration, callers can use `set_activation_weights()` to count an
+activation once for every target prefix containing its position. Exact target-specific backwards
+reuse the forward graph and call `set_gradient_normalizer()` before each backward. Random-sign
+vector-Jacobian products provide an unbiased alternative that also reuses the graph. Flattening
+token positions while accumulating the two moments drops cross-context-position terms; using a
+separate calibrator at each K/V site drops cross-site terms.
+
+For compression basis `C_k` and reconstruction basis `R_k`, key reconstruction changes the score
+to `q^T R_k C_k^T k`. Deployment can replace the coordinates with `q' = R_k^T q` and
+`k' = C_k^T k`. Likewise, value reconstruction uses `v' = C_v^T v` and absorbs `R_v` into
+`W_O`. Orthogonal PCA is the special case `C = R`.
 
 ## References
 
