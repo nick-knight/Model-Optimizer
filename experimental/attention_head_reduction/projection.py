@@ -184,10 +184,12 @@ def gradient_weighted_components(
     *,
     damping: float = 1e-6,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Return components minimizing a K-FAC squared first-order loss-gap objective.
+    """Return components minimizing a K-FAC gradient-weighted reconstruction objective.
 
     The returned compression and reconstruction bases implement the generally oblique
-    gradient-metric projection. Damping is relative to each head's mean gradient eigenvalue.
+    gradient-metric projection. This solver applies both to squared first-order loss gaps and
+    to the local quadratic approximation of output KL divergence. Damping is relative to each
+    head's mean gradient eigenvalue.
     """
     if activation_second_moment.shape != gradient_second_moment.shape:
         raise ValueError("activation and gradient second moments must have the same shape")
@@ -287,6 +289,40 @@ class HeadProjector(nn.Module):
         damping: float = 1e-6,
     ) -> "HeadProjector":
         """Construct a K-FAC projector for the squared first-order loss-gap objective."""
+        return cls.from_gradient_moments(
+            activation_second_moment,
+            gradient_second_moment,
+            ranks,
+            damping=damping,
+        )
+
+    @classmethod
+    def from_kl_divergence(
+        cls,
+        activation_second_moment: Tensor,
+        fisher_second_moment: Tensor,
+        ranks: Tensor | Sequence[int],
+        *,
+        damping: float = 1e-6,
+    ) -> "HeadProjector":
+        """Construct a K-FAC projector for the local quadratic output-KL objective."""
+        return cls.from_gradient_moments(
+            activation_second_moment,
+            fisher_second_moment,
+            ranks,
+            damping=damping,
+        )
+
+    @classmethod
+    def from_gradient_moments(
+        cls,
+        activation_second_moment: Tensor,
+        gradient_second_moment: Tensor,
+        ranks: Tensor | Sequence[int],
+        *,
+        damping: float = 1e-6,
+    ) -> "HeadProjector":
+        """Construct a K-FAC projector from activation and gradient second moments."""
         _, compression, reconstruction = gradient_weighted_components(
             activation_second_moment,
             gradient_second_moment,

@@ -1,9 +1,9 @@
 # Attention Head Dimensionality Reduction
 
 This research prototype reduces the key and value feature dimensions independently for each
-attention head. It supports activation-MSE PCA and a gradient-weighted squared-loss-gap objective,
-emulates the lossy projection while healing a student model, and is intended to absorb the frozen
-low-rank maps into attention weights for deployment.
+attention head. It supports activation-MSE PCA and gradient-weighted squared-loss-gap and output-KL
+objectives, emulates the lossy projection while healing a student model, and is intended to absorb
+the frozen low-rank maps into attention weights for deployment.
 
 ## Status
 
@@ -91,6 +91,15 @@ reuse the forward graph and call `set_gradient_normalizer()` before each backwar
 vector-Jacobian products provide an unbiased alternative that also reuses the graph. Flattening
 token positions while accumulating the two moments drops cross-context-position terms; using a
 separate calibrator at each K/V site drops cross-site terms.
+
+For `E[D_KL(p || p_hat)]`, the local second-order term uses the model Fisher. At unit temperature,
+it can be accumulated from score gradients of pseudo-labels drawn independently from `p`. Exact
+calibration sums the score outer products over the vocabulary; sampled calibration uses one packed
+backward per probe. Combining independently sampled labels for multiple next-token targets assumes
+their cross-target score-gradient products cancel in expectation. A finite number of probes does
+not cancel them exactly, so this approximation should be checked empirically if it becomes a
+material source of error. Both KL and squared-loss-gap moments use the same gradient-weighted
+eigensolver and generally produce oblique projections.
 
 For compression basis `C_k` and reconstruction basis `R_k`, key reconstruction changes the score
 to `q^T R_k C_k^T k`. Deployment can replace the coordinates with `q' = R_k^T q` and

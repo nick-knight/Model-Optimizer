@@ -169,3 +169,15 @@ def test_gradient_weighted_projector_is_optimal_oblique_projection():
     torch.testing.assert_close(objective, eigenvalues[0, 1])
     torch.testing.assert_close(projector(values), values @ column_projection.T)
     assert projector.state_dict().keys() == {"projection", "reconstruction", "ranks"}
+
+
+def test_kl_projector_uses_gradient_weighted_solver():
+    """The KL constructor should interpret its gradient moment as a model Fisher."""
+    activation_moment = torch.tensor([[[2.0, 0.5], [0.5, 1.0]]], dtype=torch.float64)
+    fisher_moment = torch.tensor([[[1.0, 0.25], [0.25, 3.0]]], dtype=torch.float64)
+
+    loss_gap = HeadProjector.from_squared_loss_gap(activation_moment, fisher_moment, ranks=[1])
+    kl = HeadProjector.from_kl_divergence(activation_moment, fisher_moment, ranks=[1])
+
+    torch.testing.assert_close(kl.projection, loss_gap.projection)
+    torch.testing.assert_close(kl.reconstruction, loss_gap.reconstruction)
