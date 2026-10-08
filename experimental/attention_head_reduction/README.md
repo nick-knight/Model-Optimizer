@@ -101,6 +101,19 @@ not cancel them exactly, so this approximation should be checked empirically if 
 material source of error. Both KL and squared-loss-gap moments use the same gradient-weighted
 eigensolver and generally produce oblique projections.
 
+Gradient-weighted solves use float64 CPU linear algebra after independently normalizing the two
+moments by their mean eigenvalue. Each nominally PSD matrix is symmetrized and checked for finite
+values and material negative eigenvalues; only roundoff-scale negative eigenvalues are clamped.
+The gradient metric is relatively damped and capped at a configurable condition number. A
+Cholesky factor and triangular solve avoid explicitly forming its inverse square root. The solver
+also checks full-rank biorthogonality and projection reconstruction before returning the bases.
+`gradient_weighted_components_with_diagnostics()` reports the original scales, eigenvalue clamps,
+condition-number floor, zero-metric fallback, Cholesky jitter, and invariant residuals.
+
+On Apple MPS, batch Gram matrices are computed in float32 on-device, then the much smaller head
+matrices are transferred to CPU and accumulated in float64. Other devices retain float64
+accumulation by default.
+
 For compression basis `C_k` and reconstruction basis `R_k`, key reconstruction changes the score
 to `q^T R_k C_k^T k`. Deployment can replace the coordinates with `q' = R_k^T q` and
 `k' = C_k^T k`. Likewise, value reconstruction uses `v' = C_v^T v` and absorbs `R_v` into

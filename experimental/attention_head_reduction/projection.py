@@ -15,18 +15,45 @@
 
 """Per-head second-moment calibration and low-rank projection."""
 
+import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
 
 __all__ = [
     "ActivationGradientCalibration",
+    "GradientWeightedDiagnostics",
     "HeadProjector",
     "SecondMomentAccumulator",
     "gradient_weighted_components",
+    "gradient_weighted_components_with_diagnostics",
     "principal_components",
 ]
+
+
+@dataclass(frozen=True)
+class GradientWeightedDiagnostics:
+    """Per-matrix numerical diagnostics from a gradient-weighted eigensolve."""
+
+    activation_scale: Tensor
+    gradient_scale: Tensor
+    activation_precision_epsilon: Tensor
+    gradient_precision_epsilon: Tensor
+    activation_min_eigenvalue: Tensor
+    gradient_min_eigenvalue: Tensor
+    transformed_min_eigenvalue: Tensor
+    activation_clamped_eigenvalues: Tensor
+    gradient_clamped_eigenvalues: Tensor
+    transformed_clamped_eigenvalues: Tensor
+    condition_number_before_floor: Tensor
+    condition_number_after_floor: Tensor
+    condition_floored_eigenvalues: Tensor
+    zero_gradient_moment: Tensor
+    cholesky_jitter: Tensor
+    biorthogonality_error: Tensor
+    full_rank_projection_error: Tensor
 
 
 class SecondMomentAccumulator:
@@ -48,6 +75,7 @@ class SecondMomentAccumulator:
         self.dtype = dtype
         self.sum = None if device is None else self._empty_sum(torch.device(device))
         self.num_samples = 0
+        self.accumulation_epsilon = 0.0
 
     @torch.no_grad()
     def update(
@@ -75,25 +103,36 @@ class SecondMomentAccumulator:
         if self.sum is None:
             self.sum = self._empty_sum(values.device)
         sample_shape = values.shape[1:-1]
-        values = values.reshape(self.num_heads, -1, self.head_dim).to(self.sum)
+        values = values.reshape(self.num_heads, -1, self.head_dim)
         if normalizer is None:
             if sample_weights is not None:
                 raise ValueError("normalizer is required with sample_weights")
             normalizer = values.shape[1]
         if normalizer <= 0:
             raise ValueError("normalizer must be positive")
-        if sample_weights is None:
-            weighted_values = values
-        else:
+        if sample_weights is not None:
             try:
                 sample_weights = torch.broadcast_to(sample_weights, sample_shape)
             except RuntimeError as error:
                 raise ValueError(
                     f"sample_weights cannot broadcast to sample shape {tuple(sample_shape)}"
                 ) from error
+        if values.device == self.sum.device:
+            values = values.to(self.sum)
+        else:
+            compute_dtype = torch.float32 if values.device.type == "mps" else self.sum.dtype
+            values = values.to(dtype=compute_dtype)
+        self.accumulation_epsilon = max(self.accumulation_epsilon, torch.finfo(values.dtype).eps)
+        if sample_weights is None:
+            weighted_values = values
+        else:
             sample_weights = sample_weights.reshape(1, -1, 1).to(values)
             weighted_values = values * sample_weights
-        self.sum.add_(torch.bmm(values.transpose(1, 2), weighted_values))
+        batch_sum = torch.bmm(values.transpose(1, 2), weighted_values)
+        if batch_sum.device != self.sum.device:
+            # Transfer before widening: MPS cannot cast a resident tensor to float64.
+            batch_sum = batch_sum.to(device=self.sum.device)
+        self.sum.add_(batch_sum.to(dtype=self.sum.dtype))
         self.num_samples += normalizer
 
     def compute(self) -> Tensor:
@@ -104,7 +143,9 @@ class SecondMomentAccumulator:
         return self.sum / self.num_samples
 
     def _empty_sum(self, device: torch.device) -> Tensor:
-        dtype = self.dtype or (torch.float32 if device.type == "mps" else torch.float64)
+        if device.type == "mps" and self.dtype in (None, torch.float64):
+            device = torch.device("cpu")
+        dtype = self.dtype or torch.float64
         return torch.zeros(self.num_heads, self.head_dim, self.head_dim, device=device, dtype=dtype)
 
 
@@ -183,6 +224,9 @@ def gradient_weighted_components(
     gradient_second_moment: Tensor,
     *,
     damping: float = 1e-6,
+    max_condition_number: float = 1e8,
+    activation_precision_epsilon: float | None = None,
+    gradient_precision_epsilon: float | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Return components minimizing a K-FAC gradient-weighted reconstruction objective.
 
@@ -190,6 +234,33 @@ def gradient_weighted_components(
     gradient-metric projection. This solver applies both to squared first-order loss gaps and
     to the local quadratic approximation of output KL divergence. Damping is relative to each
     head's mean gradient eigenvalue.
+    """
+    eigenvalues, compression, reconstruction, _ = gradient_weighted_components_with_diagnostics(
+        activation_second_moment,
+        gradient_second_moment,
+        damping=damping,
+        max_condition_number=max_condition_number,
+        activation_precision_epsilon=activation_precision_epsilon,
+        gradient_precision_epsilon=gradient_precision_epsilon,
+    )
+    return eigenvalues, compression, reconstruction
+
+
+def gradient_weighted_components_with_diagnostics(
+    activation_second_moment: Tensor,
+    gradient_second_moment: Tensor,
+    *,
+    damping: float = 1e-6,
+    max_condition_number: float = 1e8,
+    psd_tolerance_multiplier: float = 10.0,
+    activation_precision_epsilon: float | None = None,
+    gradient_precision_epsilon: float | None = None,
+) -> tuple[Tensor, Tensor, Tensor, GradientWeightedDiagnostics]:
+    """Return gradient-weighted components with numerical diagnostics.
+
+    Moment matrices are validated and normalized before a float64 CPU solve. The regularized
+    gradient metric uses a bounded condition number, and its inverse factor is obtained with a
+    triangular solve rather than an explicit inverse square root.
     """
     if activation_second_moment.shape != gradient_second_moment.shape:
         raise ValueError("activation and gradient second moments must have the same shape")
@@ -200,31 +271,246 @@ def gradient_weighted_components(
         raise ValueError("second moments must contain square matrices")
     if damping < 0:
         raise ValueError("damping must be non-negative")
+    if not math.isfinite(max_condition_number) or max_condition_number <= 1:
+        raise ValueError("max_condition_number must be finite and greater than one")
+    if not math.isfinite(psd_tolerance_multiplier) or psd_tolerance_multiplier < 0:
+        raise ValueError("psd_tolerance_multiplier must be finite and non-negative")
+    if (
+        not activation_second_moment.is_floating_point()
+        or not gradient_second_moment.is_floating_point()
+    ):
+        raise ValueError("second moments must use a floating-point dtype")
 
-    gradient_second_moment = (gradient_second_moment + gradient_second_moment.transpose(-1, -2)) / 2
-    gradient_eigenvalues, gradient_eigenvectors = torch.linalg.eigh(gradient_second_moment)
-    gradient_eigenvalues = gradient_eigenvalues.clamp_min(0)
-    scale = gradient_eigenvalues.mean(dim=-1, keepdim=True)
-    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-    gradient_eigenvalues = gradient_eigenvalues + damping * scale
-    gradient_eigenvalues = gradient_eigenvalues.clamp_min(
-        torch.finfo(gradient_eigenvalues.dtype).eps * scale
+    if activation_precision_epsilon is None:
+        activation_precision_epsilon = torch.finfo(activation_second_moment.dtype).eps
+    if gradient_precision_epsilon is None:
+        gradient_precision_epsilon = torch.finfo(gradient_second_moment.dtype).eps
+    for name, epsilon in (
+        ("activation_precision_epsilon", activation_precision_epsilon),
+        ("gradient_precision_epsilon", gradient_precision_epsilon),
+    ):
+        if not math.isfinite(epsilon) or epsilon <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+
+    output_device = activation_second_moment.device
+    output_dtype = activation_second_moment.dtype
+    if output_dtype in (torch.float16, torch.bfloat16):
+        output_dtype = torch.float32
+    activation_second_moment = activation_second_moment.to(device="cpu", dtype=torch.float64)
+    gradient_second_moment = gradient_second_moment.to(device="cpu", dtype=torch.float64)
+    (
+        activation_eigenvalues,
+        activation_eigenvectors,
+        activation_min_eigenvalue,
+        activation_clamped_eigenvalues,
+    ) = _validated_psd_eigendecomposition(
+        activation_second_moment,
+        name="activation_second_moment",
+        tolerance_multiplier=psd_tolerance_multiplier,
+        precision_epsilon=activation_precision_epsilon,
+    )
+    (
+        gradient_eigenvalues,
+        gradient_eigenvectors,
+        gradient_min_eigenvalue,
+        gradient_clamped_eigenvalues,
+    ) = _validated_psd_eigendecomposition(
+        gradient_second_moment,
+        name="gradient_second_moment",
+        tolerance_multiplier=psd_tolerance_multiplier,
+        precision_epsilon=gradient_precision_epsilon,
     )
 
-    gradient_root = _symmetric_matrix_from_eigendecomposition(
-        gradient_eigenvectors, gradient_eigenvalues.sqrt()
+    activation_scale = activation_eigenvalues.mean(dim=-1)
+    gradient_scale = gradient_eigenvalues.mean(dim=-1)
+    zero_gradient_moment = gradient_scale == 0
+    safe_activation_scale = torch.where(
+        activation_scale > 0, activation_scale, torch.ones_like(activation_scale)
     )
-    gradient_inverse_root = _symmetric_matrix_from_eigendecomposition(
-        gradient_eigenvectors, gradient_eigenvalues.rsqrt()
+    safe_gradient_scale = torch.where(
+        gradient_scale > 0, gradient_scale, torch.ones_like(gradient_scale)
     )
-    activation_second_moment = (
-        activation_second_moment + activation_second_moment.transpose(-1, -2)
-    ) / 2
-    weighted_second_moment = gradient_root @ activation_second_moment @ gradient_root
-    eigenvalues, weighted_basis = principal_components(weighted_second_moment)
-    compression_basis = gradient_root @ weighted_basis
-    reconstruction_basis = gradient_inverse_root @ weighted_basis
-    return eigenvalues, compression_basis, reconstruction_basis
+    normalized_activation = _symmetric_matrix_from_eigendecomposition(
+        activation_eigenvectors,
+        activation_eigenvalues / safe_activation_scale.unsqueeze(-1),
+    )
+    normalized_gradient_eigenvalues = gradient_eigenvalues / safe_gradient_scale.unsqueeze(-1)
+    regularized_gradient_eigenvalues = normalized_gradient_eigenvalues + damping
+    gradient_max = regularized_gradient_eigenvalues.amax(dim=-1)
+    no_metric = gradient_max == 0
+    fallback_eigenvalue = 1 / max_condition_number
+    regularized_gradient_eigenvalues = torch.where(
+        no_metric.unsqueeze(-1),
+        torch.full_like(regularized_gradient_eigenvalues, fallback_eigenvalue),
+        regularized_gradient_eigenvalues,
+    )
+    gradient_max = regularized_gradient_eigenvalues.amax(dim=-1)
+    gradient_min = regularized_gradient_eigenvalues.amin(dim=-1)
+    condition_number_before_floor = torch.where(
+        gradient_min > 0,
+        gradient_max / gradient_min,
+        torch.full_like(gradient_max, torch.inf),
+    )
+    numerical_condition_limit = min(
+        max_condition_number, 1 / torch.finfo(regularized_gradient_eigenvalues.dtype).eps
+    )
+    eigenvalue_floor = gradient_max / numerical_condition_limit
+    condition_floored_eigenvalues = (
+        regularized_gradient_eigenvalues < eigenvalue_floor.unsqueeze(-1)
+    ).sum(dim=-1)
+    regularized_gradient_eigenvalues = torch.maximum(
+        regularized_gradient_eigenvalues, eigenvalue_floor.unsqueeze(-1)
+    )
+    condition_number_after_floor = gradient_max / regularized_gradient_eigenvalues.amin(dim=-1)
+    regularized_gradient = _symmetric_matrix_from_eigendecomposition(
+        gradient_eigenvectors, regularized_gradient_eigenvalues
+    )
+    gradient_factor, cholesky_jitter = _checked_cholesky(
+        regularized_gradient,
+        gradient_max,
+    )
+    final_gradient_eigenvalues = regularized_gradient_eigenvalues + cholesky_jitter.unsqueeze(-1)
+    condition_number_after_floor = final_gradient_eigenvalues.amax(
+        dim=-1
+    ) / final_gradient_eigenvalues.amin(dim=-1)
+
+    transformed_second_moment = (
+        gradient_factor.transpose(-1, -2) @ normalized_activation @ gradient_factor
+    )
+    (
+        transformed_eigenvalues,
+        transformed_basis,
+        transformed_min_eigenvalue,
+        transformed_clamped_eigenvalues,
+    ) = _validated_psd_eigendecomposition(
+        transformed_second_moment,
+        name="transformed_second_moment",
+        tolerance_multiplier=psd_tolerance_multiplier,
+        precision_epsilon=torch.finfo(transformed_second_moment.dtype).eps,
+    )
+    transformed_eigenvalues = transformed_eigenvalues.flip(-1)
+    transformed_basis = transformed_basis.flip(-1)
+    compression_basis = gradient_factor @ transformed_basis
+    reconstruction_basis = torch.linalg.solve_triangular(
+        gradient_factor.transpose(-1, -2),
+        transformed_basis,
+        upper=True,
+    )
+    _check_finite(compression_basis, "compression_basis")
+    _check_finite(reconstruction_basis, "reconstruction_basis")
+
+    dimension = compression_basis.shape[-1]
+    identity = torch.eye(dimension, dtype=compression_basis.dtype).expand(
+        *compression_basis.shape[:-2], -1, -1
+    )
+    biorthogonality_error = torch.linalg.matrix_norm(
+        compression_basis.transpose(-1, -2) @ reconstruction_basis - identity,
+        ord="fro",
+    ) / math.sqrt(dimension)
+    full_rank_projection = reconstruction_basis @ compression_basis.transpose(-1, -2)
+    full_rank_projection_error = torch.linalg.matrix_norm(
+        full_rank_projection - identity, ord="fro"
+    ) / math.sqrt(dimension)
+    validation_tolerance = (
+        1000
+        * dimension
+        * torch.finfo(compression_basis.dtype).eps
+        * math.sqrt(numerical_condition_limit)
+    )
+    if (
+        torch.maximum(biorthogonality_error, full_rank_projection_error).amax()
+        > validation_tolerance
+    ):
+        raise RuntimeError("gradient-weighted bases failed numerical projection checks")
+
+    objective_scale = safe_activation_scale * safe_gradient_scale
+    transformed_eigenvalues = transformed_eigenvalues * objective_scale.unsqueeze(-1)
+    diagnostics = GradientWeightedDiagnostics(
+        activation_scale=activation_scale,
+        gradient_scale=gradient_scale,
+        activation_precision_epsilon=torch.tensor(
+            activation_precision_epsilon, dtype=torch.float64
+        ),
+        gradient_precision_epsilon=torch.tensor(gradient_precision_epsilon, dtype=torch.float64),
+        activation_min_eigenvalue=activation_min_eigenvalue,
+        gradient_min_eigenvalue=gradient_min_eigenvalue,
+        transformed_min_eigenvalue=transformed_min_eigenvalue,
+        activation_clamped_eigenvalues=activation_clamped_eigenvalues,
+        gradient_clamped_eigenvalues=gradient_clamped_eigenvalues,
+        transformed_clamped_eigenvalues=transformed_clamped_eigenvalues,
+        condition_number_before_floor=condition_number_before_floor,
+        condition_number_after_floor=condition_number_after_floor,
+        condition_floored_eigenvalues=condition_floored_eigenvalues,
+        zero_gradient_moment=zero_gradient_moment,
+        cholesky_jitter=cholesky_jitter,
+        biorthogonality_error=biorthogonality_error,
+        full_rank_projection_error=full_rank_projection_error,
+    )
+    return (
+        transformed_eigenvalues.to(device=output_device, dtype=output_dtype),
+        compression_basis.to(device=output_device, dtype=output_dtype),
+        reconstruction_basis.to(device=output_device, dtype=output_dtype),
+        diagnostics,
+    )
+
+
+def _validated_psd_eigendecomposition(
+    matrix: Tensor,
+    *,
+    name: str,
+    tolerance_multiplier: float,
+    precision_epsilon: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    _check_finite(matrix, name)
+    matrix = (matrix + matrix.transpose(-1, -2)) / 2
+    eigenvalues, eigenvectors = torch.linalg.eigh(matrix)
+    _check_finite(eigenvalues, f"{name} eigenvalues")
+    dimension = matrix.shape[-1]
+    spectral_scale = eigenvalues.abs().amax(dim=-1)
+    tolerance = (
+        tolerance_multiplier
+        * dimension
+        * precision_epsilon
+        * spectral_scale.clamp_min(torch.finfo(matrix.dtype).tiny)
+    )
+    minimum = eigenvalues[..., 0]
+    materially_indefinite = minimum < -tolerance
+    if materially_indefinite.any():
+        worst = minimum.amin().item()
+        worst_tolerance = tolerance.reshape(-1)[minimum.argmin()].item()
+        raise ValueError(
+            f"{name} is not positive semidefinite: minimum eigenvalue {worst:.6g} "
+            f"is below tolerance {-worst_tolerance:.6g}"
+        )
+    clamped = (eigenvalues < 0).sum(dim=-1)
+    return eigenvalues.clamp_min(0), eigenvectors, minimum, clamped
+
+
+def _checked_cholesky(matrix: Tensor, spectral_scale: Tensor) -> tuple[Tensor, Tensor]:
+    dimension = matrix.shape[-1]
+    identity = torch.eye(dimension, dtype=matrix.dtype).expand(*matrix.shape[:-2], -1, -1)
+    jitter = torch.zeros_like(spectral_scale)
+    candidate = matrix
+    for attempt in range(5):
+        factor, info = torch.linalg.cholesky_ex(candidate)
+        failed = info != 0
+        if not failed.any():
+            return factor, jitter
+        next_jitter = (
+            100
+            * dimension
+            * torch.finfo(matrix.dtype).eps
+            * spectral_scale.clamp_min(1)
+            * 10**attempt
+        )
+        jitter = torch.where(failed, next_jitter, jitter)
+        candidate = matrix + jitter.unsqueeze(-1).unsqueeze(-1) * identity
+    raise RuntimeError("regularized gradient metric remained non-positive-definite after jitter")
+
+
+def _check_finite(values: Tensor, name: str) -> None:
+    if not torch.isfinite(values).all():
+        raise ValueError(f"{name} contains non-finite values")
 
 
 def _symmetric_matrix_from_eigendecomposition(eigenvectors: Tensor, eigenvalues: Tensor) -> Tensor:
@@ -287,6 +573,7 @@ class HeadProjector(nn.Module):
         ranks: Tensor | Sequence[int],
         *,
         damping: float = 1e-6,
+        max_condition_number: float = 1e8,
     ) -> "HeadProjector":
         """Construct a K-FAC projector for the squared first-order loss-gap objective."""
         return cls.from_gradient_moments(
@@ -294,6 +581,7 @@ class HeadProjector(nn.Module):
             gradient_second_moment,
             ranks,
             damping=damping,
+            max_condition_number=max_condition_number,
         )
 
     @classmethod
@@ -304,6 +592,7 @@ class HeadProjector(nn.Module):
         ranks: Tensor | Sequence[int],
         *,
         damping: float = 1e-6,
+        max_condition_number: float = 1e8,
     ) -> "HeadProjector":
         """Construct a K-FAC projector for the local quadratic output-KL objective."""
         return cls.from_gradient_moments(
@@ -311,6 +600,7 @@ class HeadProjector(nn.Module):
             fisher_second_moment,
             ranks,
             damping=damping,
+            max_condition_number=max_condition_number,
         )
 
     @classmethod
@@ -321,12 +611,14 @@ class HeadProjector(nn.Module):
         ranks: Tensor | Sequence[int],
         *,
         damping: float = 1e-6,
+        max_condition_number: float = 1e8,
     ) -> "HeadProjector":
         """Construct a K-FAC projector from activation and gradient second moments."""
         _, compression, reconstruction = gradient_weighted_components(
             activation_second_moment,
             gradient_second_moment,
             damping=damping,
+            max_condition_number=max_condition_number,
         )
         return cls(compression, ranks, reconstruction_basis=reconstruction)
 

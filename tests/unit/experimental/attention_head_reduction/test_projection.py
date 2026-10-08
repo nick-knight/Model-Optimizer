@@ -15,6 +15,7 @@
 
 """Tests for per-head PCA calibration and projection."""
 
+import pytest
 import torch
 
 from experimental.attention_head_reduction import (
@@ -22,6 +23,7 @@ from experimental.attention_head_reduction import (
     HeadProjector,
     SecondMomentAccumulator,
     gradient_weighted_components,
+    gradient_weighted_components_with_diagnostics,
     principal_components,
 )
 
@@ -38,6 +40,21 @@ def test_second_moment_accumulates_batches_and_accepts_nonleading_head_axis():
     all_values = torch.cat((first, second), dim=0).movedim(1, 0).reshape(2, -1, 2).double()
     expected = torch.bmm(all_values.transpose(1, 2), all_values) / all_values.shape[1]
     torch.testing.assert_close(accumulator.compute(), expected)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS required")
+def test_second_moment_widens_on_cpu_after_accumulating_on_mps():
+    """MPS statistics should transfer to CPU before widening to unsupported float64."""
+    values = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]], device="mps")
+    accumulator = SecondMomentAccumulator(1, 2)
+
+    accumulator.update(values)
+
+    result = accumulator.compute()
+    expected = torch.tensor([[[5.0, 7.0], [7.0, 10.0]]], dtype=torch.float64)
+    assert result.device.type == "cpu"
+    assert result.dtype == torch.float64
+    torch.testing.assert_close(result, expected)
 
 
 def test_principal_components_are_sorted_descending():
@@ -181,3 +198,64 @@ def test_kl_projector_uses_gradient_weighted_solver():
 
     torch.testing.assert_close(kl.projection, loss_gap.projection)
     torch.testing.assert_close(kl.reconstruction, loss_gap.reconstruction)
+
+
+def test_gradient_weighted_solver_bounds_condition_number_and_reports_diagnostics():
+    """Near-null gradient directions should be floored before the triangular solve."""
+    activation_moment = torch.tensor([[[2.0, 0.25], [0.25, 1.0]]], dtype=torch.float64)
+    gradient_moment = torch.diag_embed(torch.tensor([[1.0, 1e-14]], dtype=torch.float64))
+
+    _, compression, reconstruction, diagnostics = gradient_weighted_components_with_diagnostics(
+        activation_moment,
+        gradient_moment,
+        damping=0,
+        max_condition_number=1e6,
+    )
+
+    assert diagnostics.condition_floored_eigenvalues.item() == 1
+    assert diagnostics.condition_number_before_floor.item() > 1e12
+    assert diagnostics.condition_number_after_floor.item() == pytest.approx(1e6)
+    assert diagnostics.biorthogonality_error.item() < 1e-10
+    assert diagnostics.full_rank_projection_error.item() < 1e-10
+    assert torch.isfinite(compression).all()
+    assert torch.isfinite(reconstruction).all()
+
+
+def test_gradient_weighted_solver_clamps_only_roundoff_scale_negative_eigenvalues():
+    """Small PSD violations may be rounded away, while material violations must fail."""
+    gradient_moment = torch.eye(2, dtype=torch.float64).unsqueeze(0)
+    roundoff_activation = torch.diag_embed(torch.tensor([[1.0, -1e-15]], dtype=torch.float64))
+
+    _, _, _, diagnostics = gradient_weighted_components_with_diagnostics(
+        roundoff_activation, gradient_moment
+    )
+
+    assert diagnostics.activation_clamped_eigenvalues.item() == 1
+    low_precision_roundoff = torch.diag_embed(torch.tensor([[1.0, -1e-6]], dtype=torch.float64))
+    _, _, _, diagnostics = gradient_weighted_components_with_diagnostics(
+        low_precision_roundoff,
+        gradient_moment,
+        activation_precision_epsilon=torch.finfo(torch.float32).eps,
+    )
+    assert diagnostics.activation_clamped_eigenvalues.item() == 1
+    indefinite_activation = torch.diag_embed(torch.tensor([[1.0, -1e-3]], dtype=torch.float64))
+    with pytest.raises(ValueError, match="not positive semidefinite"):
+        gradient_weighted_components(indefinite_activation, gradient_moment)
+
+
+def test_gradient_weighted_solver_rejects_nonfinite_moments_and_handles_zero_metric():
+    """Invalid statistics should fail clearly and an empty metric should use a finite fallback."""
+    activation_moment = torch.eye(2, dtype=torch.float64).unsqueeze(0)
+    nonfinite_gradient = activation_moment.clone()
+    nonfinite_gradient[0, 0, 0] = torch.nan
+    with pytest.raises(ValueError, match="non-finite"):
+        gradient_weighted_components(activation_moment, nonfinite_gradient)
+
+    _, compression, reconstruction, diagnostics = gradient_weighted_components_with_diagnostics(
+        activation_moment,
+        torch.zeros_like(activation_moment),
+        damping=0,
+    )
+    assert diagnostics.zero_gradient_moment.item()
+    assert torch.isfinite(compression).all()
+    assert torch.isfinite(reconstruction).all()
