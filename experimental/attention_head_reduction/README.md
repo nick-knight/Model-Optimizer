@@ -14,7 +14,9 @@ The first vertical slice provides:
 - batched eigendecomposition with principal components ordered by decreasing eigenvalue;
 - different retained ranks for every head; and
 - frozen orthogonal or oblique projection/reconstruction modules for compression-aware training;
-- adapters for flattened Hugging Face-style key/value linear projections.
+- adapters for flattened Hugging Face-style key/value linear projections; and
+- post-RoPE K/V transforms at explicit-QKV attention boundaries such as
+  Megatron-Core's `TEDotProductAttention`.
 
 Sensitivity-based rank allocation, architecture-specific orchestration, and weight absorption are
 planned next. The API is experimental and may change.
@@ -26,7 +28,7 @@ planned next. The API is experimental and may change.
 | PyTorch attention implementations | Partial | Core operations work with any explicit head axis |
 | Bumblebee toy Transformer | Yes | End-to-end research integration in Pulsar |
 | Hugging Face Transformers | Partial | Flattened K/V linear-output adapter; tested with Nemotron-H |
-| Megatron-Core | Planned | Architecture adapters are not implemented |
+| Megatron-Core | Partial | Shape-preserving K/V transforms at `TEDotProductAttention` |
 
 ## Deployment
 
@@ -49,6 +51,24 @@ for keys in calibration_keys:  # for example: (batch, heads, sequence, head_dim)
 projector = HeadProjector.from_second_moment(stats.compute(), ranks=[32] * 8)
 approximated_keys = projector(keys, head_axis=1)
 ```
+
+Megatron-Core and Transformer Engine pass explicit query, key, and value tensors to core
+attention. Install same-shaped K/V transforms at this boundary with:
+
+```python
+from experimental.attention_head_reduction import set_attention_key_value_transforms
+
+set_attention_key_value_transforms(
+    dot_product_attention,
+    key_projector,
+    value_projector,
+)
+```
+
+The default layout assumes the head axis is immediately before the feature axis, covering both
+SBHD and THD attention layouts. This boundary is after RoPE and after Megatron-Core's inference
+cache update. It is suitable for calibration and shape-preserving training emulation, but does not
+reduce the stored inference cache.
 
 `SecondMomentAccumulator` deliberately does not subtract the activation mean. This matches ESPACE's
 minimum-MSE construction, which uses the eigenspace of the uncentered autocorrelation matrix.
