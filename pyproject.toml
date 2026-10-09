@@ -46,6 +46,7 @@ dependencies = [
     "pulp<4.0",         # breaking changes in upcoming 4.0 release
     "pydantic>=2.0",
     "regex",
+    "requests",
     "rich",
     "safetensors",
     "scipy",
@@ -357,7 +358,7 @@ markers = [
 branch = false
 parallel = true
 concurrency = ["multiprocessing", "thread"]
-source_pkgs = ["modelopt", "modelopt_recipes"]
+source_pkgs = ["modelopt", "modelopt_recipes", "experimental.attention_head_reduction"]
 
 
 [tool.coverage.report]
