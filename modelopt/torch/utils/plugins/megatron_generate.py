@@ -128,6 +128,7 @@ def megatron_prefill(
     image_grid_thw: torch.LongTensor | None = None,
     image_sizes: torch.LongTensor | None = None,
     position_ids: torch.LongTensor | None = None,
+    packed_seq_params=None,
     skip_return_logits: bool = False,
 ) -> torch.Tensor:
     """A simple prefill function for Megatron Core V(LM) models.
@@ -139,7 +140,9 @@ def megatron_prefill(
     Under CP (>1) pass each rank its local ``input_ids`` slice (via :func:`cp_split_sequence`); the
     CP-aware attention handles causal masking internally (requires ``AttnMaskType.causal``). RoPE is
     applied by the model per CP rank, so ``position_ids`` are only needed for absolute/learned
-    position embeddings.
+    position embeddings. ``packed_seq_params`` enables Transformer Engine's THD format for a
+    flattened batch of independently attended variable-length sequences. Packed callers must pass
+    reset ``position_ids`` and pre-align the total token count for sequence parallelism.
     """
     if not isinstance(model, MegatronModule):
         raise ValueError("megatron_prefill only supports Megatron Core models.")
@@ -163,6 +166,20 @@ def megatron_prefill(
     else:
         num_pad_tokens = 0
 
+    if packed_seq_params is not None:
+        if input_ids.shape[0] != 1:
+            raise ValueError("THD packed prefill expects one flattened token stream")
+        if mpu.get_context_parallel_world_size() != 1:
+            raise NotImplementedError("packed megatron_prefill currently supports CP=1")
+        if num_pad_tokens:
+            raise ValueError(
+                "packed input length must already be divisible by tensor parallel size"
+            )
+        if position_ids is None:
+            raise ValueError("packed prefill requires reset position_ids")
+        if any(value is not None for value in (pixel_values, image_grid_thw, image_sizes)):
+            raise ValueError("packed prefill does not support vision inputs")
+
     if num_pad_tokens > 0:
         tokens = torch.cat(
             [
@@ -183,7 +200,7 @@ def megatron_prefill(
 
     # Under CP a local triu mask would be wrong for the per-rank zigzag chunks; pass None and let
     # the CP-aware causal attention build it. Without CP the causal mask must be supplied explicitly.
-    if cp_size > 1:
+    if cp_size > 1 or packed_seq_params is not None:
         attention_mask = None
     else:
         attention_mask = (
@@ -245,7 +262,10 @@ def megatron_prefill(
             forward_kwargs["image_sizes"] = image_sizes
         output = model(**forward_kwargs)
     else:
-        output = model(tokens, position_ids, attention_mask, runtime_gather_output=True)
+        forward_kwargs = {"runtime_gather_output": True}
+        if packed_seq_params is not None:
+            forward_kwargs["packed_seq_params"] = packed_seq_params
+        output = model(tokens, position_ids, attention_mask, **forward_kwargs)
 
     # Some VLM wrappers (e.g. Gemma3VLModel) return ``(logits, loss_mask)`` rather than a bare tensor.
     if isinstance(output, (tuple, list)):
