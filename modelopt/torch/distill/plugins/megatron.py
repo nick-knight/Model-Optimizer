@@ -32,6 +32,7 @@ import torch.nn.functional as F
 import yaml
 from megatron.core import parallel_state
 from megatron.core.pipeline_parallel.schedules import get_tensor_shapes
+from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer import MegatronModule, TransformerLayer
 from megatron.core.utils import get_model_config
 from torch import Tensor
@@ -58,6 +59,8 @@ class DistillationConfig:
         logit_layers: Tuple of logit layer names.
         skip_lm_loss: Whether to skip computing the standard language model loss (default: ``True``).
         kd_loss_scale: Relative scaling factor for the distillation loss if ``skip_lm_loss`` is ``False``.
+        logit_loss_type: Full-vocabulary logits loss, either ``"kl"`` or ``"jaccard"``.
+        logit_jaccard_chunk_size: Optional sequence-axis chunk size for Jaccard temporaries.
         logit_kl_temperature: Temperature for the logit KL-divergence loss.
         logit_kl_topk: If not None, use TopKLogitsKLLoss instead of LogitsKLLoss with this top-k value.
     """
@@ -66,6 +69,8 @@ class DistillationConfig:
     logit_layers: tuple[str, str] = ("output_layer", "output_layer")
     skip_lm_loss: bool = True
     kd_loss_scale: float = 1.0
+    logit_loss_type: str = "kl"
+    logit_jaccard_chunk_size: int = 0
     logit_kl_temperature: float = 1.0
     logit_kl_topk: int | None = None
     criterion: Criterion | None = None
@@ -77,6 +82,8 @@ class DistillationConfig:
             f"{self.intermediate_layer_pairs=}"
         )
         assert self.kd_loss_scale > 0, f"{self.kd_loss_scale=}"
+        assert self.logit_loss_type in ("kl", "jaccard"), f"{self.logit_loss_type=}"
+        assert self.logit_jaccard_chunk_size >= 0, f"{self.logit_jaccard_chunk_size=}"
         assert self.logit_kl_temperature > 0, f"{self.logit_kl_temperature=}"
 
     @staticmethod
@@ -130,7 +137,15 @@ def setup_distillation_config(
             # Use TopKLogitsKLLoss if logit_kl_topk is specified, otherwise use LogitsKLLoss
             if cfg.logit_kl_topk is not None:
                 criterion[tuple(cfg.logit_layers)] = TopKLogitsKLLoss(
-                    student_cfg, temperature=cfg.logit_kl_temperature, top_k=cfg.logit_kl_topk
+                    student_cfg,
+                    temperature=cfg.logit_kl_temperature,
+                    top_k=cfg.logit_kl_topk,
+                )
+            elif cfg.logit_loss_type == "jaccard":
+                criterion[tuple(cfg.logit_layers)] = LogitsJaccardLoss(
+                    student_cfg,
+                    temperature=cfg.logit_kl_temperature,
+                    chunk_size=cfg.logit_jaccard_chunk_size,
                 )
             else:
                 criterion[tuple(cfg.logit_layers)] = LogitsKLLoss(
@@ -140,7 +155,9 @@ def setup_distillation_config(
             projection_layer = ProjectionLayer(student_cfg, teacher_cfg)
 
             for entry in cfg.intermediate_layer_pairs:
-                student_layer, teacher_layer, loss_fn = cfg.parse_intermediate_entry(entry)
+                student_layer, teacher_layer, loss_fn = cfg.parse_intermediate_entry(
+                    entry
+                )
                 if parallel_state.get_tensor_and_context_parallel_rank() == 0:
                     logger.info(
                         "Distillation: Adding intermediate loss between"
@@ -173,7 +190,9 @@ def _adjust_layer_index_for_pp(submodule_name, model_cfg):
     if new_layer_idx < 0:
         raise ValueError(f"Layer {submodule_name} does not fall on final PP rank.")
 
-    new_submodule_name = submodule_name.replace(f".{match.group(0)}", f".{new_layer_idx}")
+    new_submodule_name = submodule_name.replace(
+        f".{match.group(0)}", f".{new_layer_idx}"
+    )
     if parallel_state.get_tensor_and_context_parallel_rank() == 0:
         logger.info(
             f'Distillation: Renamed layer "{submodule_name}" on final PP rank to "{new_submodule_name}"'
@@ -188,7 +207,9 @@ class BaseLoss(_Loss, metaclass=ABCMeta):
     """Abstract base class for Megatron distillation losses."""
 
     def __init__(
-        self, model_config: "TransformerConfig", projection_layer: nn.Module | None = None
+        self,
+        model_config: "TransformerConfig",
+        projection_layer: nn.Module | None = None,
     ):
         """Constructor.
 
@@ -200,7 +221,9 @@ class BaseLoss(_Loss, metaclass=ABCMeta):
         self._config = model_config
         self._projection = projection_layer
 
-    def pre_forward(self, predictions: Tensor, targets: Tensor) -> tuple[Tensor, Tensor]:
+    def pre_forward(
+        self, predictions: Tensor, targets: Tensor
+    ) -> tuple[Tensor, Tensor]:
         """Performs projection of student tensor to match teacher's size if necessary."""
         if isinstance(predictions, tuple):
             # `ColumnParallelLinear` returns bias too
@@ -238,7 +261,9 @@ class MSELoss(BaseLoss):
         loss = F.mse_loss(predictions, targets, reduction="none")
         loss = loss.mean(dim=-1)
 
-        return self.post_forward(loss, is_sequence_parallel=self._config.sequence_parallel)
+        return self.post_forward(
+            loss, is_sequence_parallel=self._config.sequence_parallel
+        )
 
 
 class HiddenStateCosineLoss(BaseLoss):
@@ -249,7 +274,9 @@ class HiddenStateCosineLoss(BaseLoss):
     """
 
     def __init__(
-        self, model_config: "TransformerConfig", projection_layer: nn.Module | None = None
+        self,
+        model_config: "TransformerConfig",
+        projection_layer: nn.Module | None = None,
     ):
         """Constructor.
 
@@ -287,14 +314,19 @@ class HiddenStateCosineLoss(BaseLoss):
         loss = loss.view(*predictions.shape[:2])
 
         # NOTE: Tensor sequence length is still split among TP ranks.
-        return self.post_forward(loss, is_sequence_parallel=self._config.sequence_parallel)
+        return self.post_forward(
+            loss, is_sequence_parallel=self._config.sequence_parallel
+        )
 
 
 class LogitsKLLoss(BaseLoss):
     """Calculates KL-Divergence loss between two logits tensors without reducing the sequence dim."""
 
     def __init__(
-        self, model_config: "TransformerConfig", temperature: float = 1.0, reverse: bool = False
+        self,
+        model_config: "TransformerConfig",
+        temperature: float = 1.0,
+        reverse: bool = False,
     ):
         """Constructor.
 
@@ -361,7 +393,10 @@ class LogitsKLLoss(BaseLoss):
             p, q = student_log_prob, teacher_log_prob
         else:
             # Compute log probabilities
-            p, q = F.log_softmax(output_student, dim=-1), F.log_softmax(output_teacher, dim=-1)
+            p, q = (
+                F.log_softmax(output_student, dim=-1),
+                F.log_softmax(output_teacher, dim=-1),
+            )
 
         # KL divergence
         if self._reverse:
@@ -369,6 +404,85 @@ class LogitsKLLoss(BaseLoss):
         loss = torch.sum(F.kl_div(p, q, reduction="none", log_target=True), dim=-1)
 
         return self.post_forward(loss, tp_reduce=True)
+
+
+class LogitsJaccardLoss(BaseLoss):
+    """Jaccard distance between student and teacher probability distributions.
+
+    For normalized distributions this is a monotone transform of total variation:
+    ``2 * TV / (1 + TV)``. The teacher is detached. Under vocabulary tensor
+    parallelism, differentiable denominator reductions preserve student gradients,
+    while Megatron's forward-reduce/backward-identity primitive combines the local
+    intersection and union contributions exactly once.
+    """
+
+    def __init__(
+        self,
+        model_config: "TransformerConfig",
+        temperature: float = 1.0,
+        chunk_size: int = 0,
+    ):
+        """Initialize a unit-temperature-compatible, optionally chunked loss."""
+        super().__init__(model_config)
+        if temperature <= 0:
+            raise ValueError("temperature must be positive")
+        if chunk_size < 0:
+            raise ValueError("chunk_size cannot be negative")
+        self._temperature = temperature
+        self._chunk_size = chunk_size
+
+    def _chunk_loss(self, predictions: Tensor, targets: Tensor) -> Tensor:
+        student = predictions.float() / self._temperature
+        teacher = targets.detach().float() / self._temperature
+        if self._config.tensor_model_parallel_size > 1:
+            group = parallel_state.get_tensor_model_parallel_group()
+
+            student_maximum = student.detach().amax(dim=-1, keepdim=True)
+            torch.distributed.all_reduce(
+                student_maximum, op=torch.distributed.ReduceOp.MAX, group=group
+            )
+            student_exp = (student - student_maximum).exp()
+            student_denominator = dist_nn.functional.all_reduce(
+                student_exp.sum(dim=-1, keepdim=True), group=group
+            )
+            p_student = student_exp / student_denominator
+
+            with torch.no_grad():
+                teacher_maximum = teacher.amax(dim=-1, keepdim=True)
+                torch.distributed.all_reduce(
+                    teacher_maximum, op=torch.distributed.ReduceOp.MAX, group=group
+                )
+                teacher_exp = (teacher - teacher_maximum).exp()
+                teacher_denominator = teacher_exp.sum(dim=-1, keepdim=True)
+                torch.distributed.all_reduce(teacher_denominator, group=group)
+                p_teacher = teacher_exp / teacher_denominator
+
+            intersection = reduce_from_tensor_model_parallel_region(
+                torch.minimum(p_student, p_teacher).sum(dim=-1), group=group
+            )
+            union = reduce_from_tensor_model_parallel_region(
+                torch.maximum(p_student, p_teacher).sum(dim=-1), group=group
+            )
+        else:
+            p_student = F.softmax(student, dim=-1)
+            p_teacher = F.softmax(teacher, dim=-1)
+            intersection = torch.minimum(p_student, p_teacher).sum(dim=-1)
+            union = torch.maximum(p_student, p_teacher).sum(dim=-1)
+        return 1.0 - intersection / (union + 1e-8)
+
+    def forward(self, predictions: Tensor, targets: Tensor) -> Tensor:
+        """Return an unreduced per-token loss shaped for Megatron loss masking."""
+        predictions, targets = self.pre_forward(predictions, targets)
+        chunk_size = min(self._chunk_size or predictions.shape[0], predictions.shape[0])
+        losses = [
+            self._chunk_loss(
+                predictions[start : start + chunk_size],
+                targets[start : start + chunk_size],
+            )
+            for start in range(0, predictions.shape[0], chunk_size)
+        ]
+        loss = torch.cat(losses, dim=0) if len(losses) > 1 else losses[0]
+        return self.post_forward(loss, tp_reduce=False)
 
 
 class TopKLogitsKLLoss(LogitsKLLoss):
@@ -437,10 +551,14 @@ class TopKLogitsKLLoss(LogitsKLLoss):
             all_student_vals = torch.cat(all_student_vals, dim=-1)
 
             # Pick the true Top-K based on Teacher values
-            global_top_vals, global_top_idx = torch.topk(all_teacher_vals, self.top_k, dim=-1)
+            global_top_vals, global_top_idx = torch.topk(
+                all_teacher_vals, self.top_k, dim=-1
+            )
 
             final_teacher_logits = global_top_vals
-            final_student_logits = torch.gather(all_student_vals, dim=-1, index=global_top_idx)
+            final_student_logits = torch.gather(
+                all_student_vals, dim=-1, index=global_top_idx
+            )
         else:
             final_teacher_logits = top_teacher_vals
             final_student_logits = top_student_vals
@@ -504,7 +622,9 @@ class LogitsAndIntermediatesLossBalancer(mtd.DistillationLossBalancer):
             total_loss = logits_loss + intermediate_loss_scaled
         else:
             kd_loss = logits_loss + intermediate_loss_scaled
-            if kd_loss > 0 and original_loss > 0:  # zero when one CP rank has only context tokens
+            if (
+                kd_loss > 0 and original_loss > 0
+            ):  # zero when one CP rank has only context tokens
                 kd_loss *= original_loss.detach() / kd_loss.detach()
             total_loss = original_loss + kd_loss * self._kd_loss_scale
 
@@ -519,7 +639,9 @@ class LogitsAndIntermediatesLossBalancer(mtd.DistillationLossBalancer):
 class ProjectionLayer(MegatronModule):
     """Module to project student layer activations to teacher's size."""
 
-    def __init__(self, student_config: "TransformerConfig", teacher_config: "TransformerConfig"):
+    def __init__(
+        self, student_config: "TransformerConfig", teacher_config: "TransformerConfig"
+    ):
         """Constructor.
 
         Args:
@@ -530,10 +652,14 @@ class ProjectionLayer(MegatronModule):
         if student_config.hidden_size == teacher_config.hidden_size:
             self._fit = nn.Identity()
         else:
-            self._fit = nn.Linear(student_config.hidden_size, teacher_config.hidden_size)
+            self._fit = nn.Linear(
+                student_config.hidden_size, teacher_config.hidden_size
+            )
             self.apply(self._init_weights)
             # Attribute below needed to reduce gradients during backward properly.
-            setattr(self._fit.weight, "sequence_parallel", self.config.sequence_parallel)
+            setattr(
+                self._fit.weight, "sequence_parallel", self.config.sequence_parallel
+            )
             setattr(self._fit.bias, "sequence_parallel", self.config.sequence_parallel)
 
     def forward(self, student_tensor: Tensor):
@@ -595,7 +721,11 @@ def adjust_distillation_model_for_mcore(
         self._lm_loss_call_count += 1
         mtp_num_layers = self.config.mtp_num_layers or 0
         is_mtp_call = self._lm_loss_call_count <= mtp_num_layers
-        if distill_cfg.skip_lm_loss and self.training and (not is_mtp_call or skip_mtp_loss):
+        if (
+            distill_cfg.skip_lm_loss
+            and self.training
+            and (not is_mtp_call or skip_mtp_loss)
+        ):
             return torch.zeros_like(labels, dtype=logits.dtype)
         return type(self).compute_language_model_loss(self, labels, logits)
 
@@ -615,15 +745,19 @@ def adjust_distillation_model_for_mcore(
 
     def _set_input_tensor(self, input_tensors: list[Tensor]):
         teacher_inputs = [
-            t[..., self._tensor_split_idx :] if t is not None else t for t in input_tensors
+            t[..., self._tensor_split_idx :] if t is not None else t
+            for t in input_tensors
         ]
         student_inputs = [
-            t[..., : self._tensor_split_idx] if t is not None else t for t in input_tensors
+            t[..., : self._tensor_split_idx] if t is not None else t
+            for t in input_tensors
         ]
         type(self).set_input_tensor(self.teacher_model, teacher_inputs)
         type(self).set_input_tensor(self, student_inputs)
 
-    model.set_student_input_tensor_shape = MethodType(_set_student_input_tensor_shape, model)
+    model.set_student_input_tensor_shape = MethodType(
+        _set_student_input_tensor_shape, model
+    )
     model.set_input_tensor = MethodType(_set_input_tensor, model)
 
     # HACK: Concatenate output tensors when PP>1 so they can be passed between ranks.
@@ -667,7 +801,8 @@ def get_tensor_shapes_adjust_fn_for_distillation(
         return None
 
     def adjust_tensor_shapes(
-        recv_tensor_shapes: list[tuple[int, ...]], send_tensor_shapes: list[tuple[int, ...]]
+        recv_tensor_shapes: list[tuple[int, ...]],
+        send_tensor_shapes: list[tuple[int, ...]],
     ):
         teacher_config = get_model_config(model.teacher_model)
         tp_group = parallel_state.get_tensor_model_parallel_group()

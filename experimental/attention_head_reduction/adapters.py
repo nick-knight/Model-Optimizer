@@ -43,9 +43,11 @@ class AttentionKeyValueHeadTransform(nn.Module):
 
     def forward(self, key: Tensor, value: Tensor) -> tuple[Tensor, Tensor]:
         """Transform key and value while preserving their public layouts."""
-        return self._apply(self.key_transform, key), self._apply(self.value_transform, value)
+        return self._apply_transform(self.key_transform, key), self._apply_transform(
+            self.value_transform, value
+        )
 
-    def _apply(self, transform: nn.Module, values: Tensor) -> Tensor:
+    def _apply_transform(self, transform: nn.Module, values: Tensor) -> Tensor:
         if values.ndim < 2:
             raise ValueError("attention tensors must have a head axis and a feature axis")
         head_axis = self.head_axis % values.ndim

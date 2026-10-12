@@ -16,6 +16,7 @@
 """A simple generate Megatron (V)LM models."""
 
 import inspect
+from functools import wraps
 
 import torch
 from megatron.core import mpu
@@ -40,7 +41,9 @@ _CP_BATCH_KWARGS = (
 )
 
 
-def cp_split_sequence(input_ids: torch.Tensor, cp_group) -> tuple[torch.Tensor, torch.Tensor]:
+def cp_split_sequence(
+    input_ids: torch.Tensor, cp_group
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Partition ``input_ids`` + global ``position_ids`` across the CP group (zigzag layout).
 
     Returns ``(local_input_ids, local_position_ids)`` for this CP rank; inverse is
@@ -67,7 +70,9 @@ def cp_split_sequence(input_ids: torch.Tensor, cp_group) -> tuple[torch.Tensor, 
     return batch["input_ids"], batch["position_ids"]
 
 
-def cp_gather_logits(local_logits: torch.Tensor, cp_group, global_seq_len: int) -> torch.Tensor:
+def cp_gather_logits(
+    local_logits: torch.Tensor, cp_group, global_seq_len: int
+) -> torch.Tensor:
     """Reconstruct full-sequence logits from per-CP-rank logits (inverse of :func:`cp_split_sequence`).
 
     Rank ``r`` holds the zigzag pair ``[chunk_r, chunk_{2*cp_size-1-r}]``; all-gather and re-order
@@ -88,7 +93,9 @@ def cp_gather_logits(local_logits: torch.Tensor, cp_group, global_seq_len: int) 
     return torch.cat(chunks, dim=1)
 
 
-def _assert_mamba_within_int32_indexing(model: MegatronModule, batch_size: int, seq_length: int):
+def _assert_mamba_within_int32_indexing(
+    model: MegatronModule, batch_size: int, seq_length: int
+):
     """Guard Mamba2 calibration against int32 activation-indexing overflow.
 
     The SSD Triton kernels index activations with int32, so ``batch * seq * mamba in_proj`` must stay
@@ -97,7 +104,12 @@ def _assert_mamba_within_int32_indexing(model: MegatronModule, batch_size: int, 
     d = getattr(model, "_modelopt_max_mamba_in_proj", None)
     if d is None:
         d = max(
-            (m.in_proj.weight.shape[0] for m in model.modules() if hasattr(m, "in_proj")), default=0
+            (
+                m.in_proj.weight.shape[0]
+                for m in model.modules()
+                if hasattr(m, "in_proj")
+            ),
+            default=0,
         )
         model._modelopt_max_mamba_in_proj = d
     if d and batch_size * seq_length * d >= 2**31:
@@ -120,7 +132,19 @@ def get_current_memory_info():
     return info
 
 
-@torch.no_grad()
+def _prefill_grad_mode(function):
+    """Preserve inference no-grad while permitting explicit calibration backwards."""
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        detach_output = args[8] if len(args) > 8 else kwargs.get("detach_output", True)
+        with torch.set_grad_enabled(not detach_output):
+            return function(*args, **kwargs)
+
+    return wrapped
+
+
+@_prefill_grad_mode
 def megatron_prefill(
     model: MegatronModule,
     input_ids: torch.LongTensor,
@@ -130,6 +154,7 @@ def megatron_prefill(
     position_ids: torch.LongTensor | None = None,
     packed_seq_params=None,
     skip_return_logits: bool = False,
+    detach_output: bool = True,
 ) -> torch.Tensor:
     """A simple prefill function for Megatron Core V(LM) models.
 
@@ -142,7 +167,9 @@ def megatron_prefill(
     applied by the model per CP rank, so ``position_ids`` are only needed for absolute/learned
     position embeddings. ``packed_seq_params`` enables Transformer Engine's THD format for a
     flattened batch of independently attended variable-length sequences. Packed callers must pass
-    reset ``position_ids`` and pre-align the total token count for sequence parallelism.
+    reset ``position_ids`` and pre-align the total token count for sequence parallelism. Set
+    ``detach_output=False`` only for calibration procedures that explicitly back-propagate logits;
+    generation and evaluation callers should retain the default.
     """
     if not isinstance(model, MegatronModule):
         raise ValueError("megatron_prefill only supports Megatron Core models.")
@@ -177,14 +204,18 @@ def megatron_prefill(
             )
         if position_ids is None:
             raise ValueError("packed prefill requires reset position_ids")
-        if any(value is not None for value in (pixel_values, image_grid_thw, image_sizes)):
+        if any(
+            value is not None for value in (pixel_values, image_grid_thw, image_sizes)
+        ):
             raise ValueError("packed prefill does not support vision inputs")
 
     if num_pad_tokens > 0:
         tokens = torch.cat(
             [
                 input_ids,
-                torch.zeros(batch_size, num_pad_tokens, dtype=input_ids.dtype, device=device),
+                torch.zeros(
+                    batch_size, num_pad_tokens, dtype=input_ids.dtype, device=device
+                ),
             ],
             dim=-1,
         )
@@ -205,7 +236,8 @@ def megatron_prefill(
     else:
         attention_mask = (
             torch.triu(
-                torch.ones((batch_size, padded_seq_len, padded_seq_len), device=device), diagonal=1
+                torch.ones((batch_size, padded_seq_len, padded_seq_len), device=device),
+                diagonal=1,
             )
             .bool()
             .view(batch_size, 1, padded_seq_len, padded_seq_len)
@@ -224,7 +256,9 @@ def megatron_prefill(
         position_ids = torch.cat(
             [
                 position_ids,
-                torch.zeros(batch_size, num_pad_tokens, dtype=position_ids.dtype, device=device),
+                torch.zeros(
+                    batch_size, num_pad_tokens, dtype=position_ids.dtype, device=device
+                ),
             ],
             dim=-1,
         )
@@ -243,7 +277,9 @@ def megatron_prefill(
         get_attr_wrapped_model(model, "set_input_tensor")(recv_buffer)
 
     has_vision_inputs = (
-        pixel_values is not None or image_grid_thw is not None or image_sizes is not None
+        pixel_values is not None
+        or image_grid_thw is not None
+        or image_sizes is not None
     )
     if has_vision_inputs:
         forward_kwargs: dict = {
@@ -280,7 +316,11 @@ def megatron_prefill(
 
     # .contiguous() is required because the slice is a view with the padded stride; the broadcast
     # below asserts contiguity when SP pads seq_length up to a multiple of TP.
-    logits = output[:, :seq_length, :].detach().contiguous() if pp_last else None
+    logits = output[:, :seq_length, :] if pp_last else None
+    if logits is not None and detach_output:
+        logits = logits.detach()
+    if logits is not None:
+        logits = logits.contiguous()
 
     if model.config.bf16:
         logits_dtype = torch.bfloat16
@@ -295,9 +335,17 @@ def megatron_prefill(
     vocab_size = getattr(model, "vocab_size", None)
     if vocab_size is None:
         vocab_size = getattr(model, "language_model", model).vocab_size
-    result = broadcast_from_last_pipeline_stage(
-        [batch_size, seq_length, vocab_size], logits_dtype, logits
-    )
+    # A distributed broadcast is not autograd-aware. PP=1 needs no communication and must
+    # preserve the logits graph for gradient-based calibration. Gradient prefill over PP>1
+    # would require an autograd-aware pipeline implementation and is intentionally unsupported.
+    if not is_pp:
+        result = logits
+    else:
+        if not detach_output:
+            raise NotImplementedError("gradient-enabled megatron_prefill requires PP=1")
+        result = broadcast_from_last_pipeline_stage(
+            [batch_size, seq_length, vocab_size], logits_dtype, logits
+        )
     return None if skip_return_logits else result
 
 
@@ -342,7 +390,9 @@ def megatron_generate(
 
     if model.config.sequence_parallel and enable_kv_cache:
         enable_kv_cache = False
-        print("Turing off kv-cache decoding since is not implemented for sequence parallelism!")
+        print(
+            "Turing off kv-cache decoding since is not implemented for sequence parallelism!"
+        )
 
     model.eval()
 
@@ -401,7 +451,10 @@ def megatron_generate(
         # SelfAttention.forward() when inference_context is provided.
         if seq_len > 1:
             attention_mask = (
-                torch.triu(torch.ones((batch_size, seq_len, seq_len), device=device), diagonal=1)
+                torch.triu(
+                    torch.ones((batch_size, seq_len, seq_len), device=device),
+                    diagonal=1,
+                )
                 .bool()
                 .view(batch_size, 1, seq_len, seq_len)
             )
@@ -466,7 +519,11 @@ def megatron_generate(
             send_to_next_pipeline_rank(output.to(dtype=pp_dtype))
 
         if pp_last:
-            eager_ids = output[:, -(num_pad_tokens + 1), :].argmax(dim=-1, keepdim=True).detach()
+            eager_ids = (
+                output[:, -(num_pad_tokens + 1), :]
+                .argmax(dim=-1, keepdim=True)
+                .detach()
+            )
         else:
             eager_ids = None
 
