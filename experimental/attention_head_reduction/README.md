@@ -29,6 +29,7 @@ planned next. The API is experimental and may change.
 | Bumblebee toy Transformer | Yes | End-to-end research integration in Pulsar |
 | Hugging Face Transformers | Partial | Flattened K/V linear-output adapter; tested with Nemotron-H |
 | Megatron-Core | Partial | Shape-preserving K/V transforms at `TEDotProductAttention` |
+| vLLM | Partial | Shape-preserving K/V transforms before the paged-cache write |
 
 ## Deployment
 
@@ -36,7 +37,7 @@ planned next. The API is experimental and may change.
 | --- | --- | --- |
 | PyTorch eager | Emulation only | Projection and reconstruction retain original tensor shapes |
 | TensorRT-LLM | No | Variable per-head dimensions require an export representation and kernels |
-| vLLM | No | Variable per-head dimensions require an export representation and kernels |
+| vLLM | Emulation only | Paged-cache dimensions are unchanged; TP-sharded K/V heads are supported |
 | SGLang | No | Variable per-head dimensions require an export representation and kernels |
 
 ## Usage
@@ -69,6 +70,24 @@ The default layout assumes the head axis is immediately before the feature axis,
 SBHD and THD attention layouts. This boundary is after RoPE and after Megatron-Core's inference
 cache update. It is suitable for calibration and shape-preserving training emulation, but does not
 reduce the stored inference cache.
+
+vLLM passes flattened K/V tensors to its attention module before updating the paged cache. The
+example worker installs the same-shaped projectors at that boundary after model loading:
+
+```bash
+MODELOPT_HEAD_REDUCTION_PROJECTION_PATH=/path/to/projections.pt \
+PYTHONPATH=$PWD:$PWD/examples/vllm_serve \
+vllm serve /path/to/hf-checkpoint \
+  --worker-cls head_reduction_worker.HeadReductionWorker \
+  --enforce-eager --no-enable-prefix-caching
+```
+
+Set `MODELOPT_HEAD_REDUCTION_RANK` to override the artifact's uniform retained rank, or
+`MODELOPT_HEAD_REDUCTION_RANK_ALLOCATION_PATH` for a complete heterogeneous allocation. The
+runtime validates every artifact layer and TP head shard before attaching any hook. Prefix caching,
+speculative decoding, and CUDA graphs remain disabled until their interactions with the hook have
+been tested. This path measures algorithmic quality but does not reduce vLLM's cache allocation or
+attention-kernel complexity.
 
 `SecondMomentAccumulator` deliberately does not subtract the activation mean. This matches ESPACE's
 minimum-MSE construction, which uses the eigenspace of the uncentered autocorrelation matrix.

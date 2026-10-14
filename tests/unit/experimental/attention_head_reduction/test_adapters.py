@@ -15,12 +15,14 @@
 
 """Tests for adapters around attention head tensors."""
 
+import pytest
 import torch
 from torch import nn
 
 from experimental.attention_head_reduction import (
     HeadProjector,
     set_attention_key_value_transforms,
+    set_flattened_attention_key_value_transforms,
     set_linear_head_transform,
 )
 
@@ -86,6 +88,45 @@ def test_setting_attention_transform_twice_does_not_stack_forward_hooks():
     torch.testing.assert_close(value, key)
 
 
+def test_flattened_attention_transform_applies_before_attention_forward():
+    """vLLM-style flattened K/V inputs should be projected per head."""
+    attention = ExplicitQKVAttention()
+    basis = torch.eye(3).expand(2, -1, -1)
+    set_flattened_attention_key_value_transforms(
+        attention,
+        HeadProjector(basis, ranks=[1, 2]),
+        HeadProjector(basis, ranks=[2, 1]),
+        num_heads=2,
+        head_dim=3,
+    )
+    values = torch.arange(12.0).reshape(2, 6)
+
+    _, key, value = attention(values, values, values)
+
+    torch.testing.assert_close(
+        key,
+        torch.tensor([[0.0, 0.0, 0.0, 3.0, 4.0, 0.0], [6.0, 0.0, 0.0, 9.0, 10.0, 0.0]]),
+    )
+    torch.testing.assert_close(
+        value,
+        torch.tensor([[0.0, 1.0, 0.0, 3.0, 0.0, 0.0], [6.0, 7.0, 0.0, 9.0, 0.0, 0.0]]),
+    )
+
+
+def test_flattened_attention_transform_rejects_an_incompatible_layout():
+    attention = ExplicitQKVAttention()
+    set_flattened_attention_key_value_transforms(
+        attention,
+        nn.Identity(),
+        nn.Identity(),
+        num_heads=2,
+        head_dim=3,
+    )
+
+    with pytest.raises(ValueError, match="final dimension of 6"):
+        attention(torch.ones(2, 5), torch.ones(2, 5), torch.ones(2, 5))
+
+
 def test_linear_output_transform_applies_independently_per_head():
     """Flattened Hugging Face K/V projections should preserve their public shape."""
     linear = nn.Linear(2, 6, bias=False)
@@ -113,4 +154,6 @@ def test_setting_transform_twice_does_not_stack_forward_hooks():
     set_linear_head_transform(linear, projector, num_heads=2, head_dim=2)
 
     assert len(linear._forward_hooks) == 1
-    torch.testing.assert_close(linear(torch.ones(1, 4)), torch.tensor([[1.0, 0.0, 1.0, 0.0]]))
+    torch.testing.assert_close(
+        linear(torch.ones(1, 4)), torch.tensor([[1.0, 0.0, 1.0, 0.0]])
+    )

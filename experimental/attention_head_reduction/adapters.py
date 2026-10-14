@@ -19,8 +19,10 @@ from torch import Tensor, nn
 
 __all__ = [
     "AttentionKeyValueHeadTransform",
+    "FlattenedAttentionKeyValueHeadTransform",
     "LinearOutputHeadTransform",
     "set_attention_key_value_transforms",
+    "set_flattened_attention_key_value_transforms",
     "set_linear_head_transform",
 ]
 
@@ -49,7 +51,9 @@ class AttentionKeyValueHeadTransform(nn.Module):
 
     def _apply_transform(self, transform: nn.Module, values: Tensor) -> Tensor:
         if values.ndim < 2:
-            raise ValueError("attention tensors must have a head axis and a feature axis")
+            raise ValueError(
+                "attention tensors must have a head axis and a feature axis"
+            )
         head_axis = self.head_axis % values.ndim
         if head_axis == values.ndim - 1:
             raise ValueError("head_axis cannot be the final feature axis")
@@ -110,6 +114,77 @@ def set_attention_key_value_transforms(
         value_transform,
         head_axis=head_axis,
     )
+    _set_attention_key_value_adapter(attention, adapter)
+
+
+class FlattenedAttentionKeyValueHeadTransform(nn.Module):
+    """Apply per-head transforms to flattened attention K/V tensors."""
+
+    def __init__(
+        self,
+        key_transform: nn.Module,
+        value_transform: nn.Module,
+        *,
+        num_heads: int,
+        head_dim: int,
+        value_head_dim: int | None = None,
+    ) -> None:
+        super().__init__()
+        if num_heads < 1 or head_dim < 1:
+            raise ValueError("num_heads and head_dim must be positive")
+        if value_head_dim is None:
+            value_head_dim = head_dim
+        if value_head_dim < 1:
+            raise ValueError("value_head_dim must be positive")
+        self.key_transform = key_transform
+        self.value_transform = value_transform
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.value_head_dim = value_head_dim
+
+    def forward(self, key: Tensor, value: Tensor) -> tuple[Tensor, Tensor]:
+        """Transform flattened K/V tensors while preserving their layouts."""
+        return self._apply(self.key_transform, key, self.head_dim), self._apply(
+            self.value_transform, value, self.value_head_dim
+        )
+
+    def _apply(self, transform: nn.Module, values: Tensor, head_dim: int) -> Tensor:
+        expected = self.num_heads * head_dim
+        if values.shape[-1] != expected:
+            raise ValueError(
+                f"expected a final dimension of {expected}, got {values.shape[-1]}"
+            )
+        per_head = values.unflatten(-1, (self.num_heads, head_dim))
+        transformed = transform(per_head.movedim(-2, 0)).movedim(0, -2)
+        if transformed.shape != per_head.shape:
+            raise ValueError(
+                "attention head transforms must preserve shape; "
+                f"got {tuple(transformed.shape)} instead of {tuple(per_head.shape)}"
+            )
+        return transformed.flatten(-2)
+
+
+def set_flattened_attention_key_value_transforms(
+    attention: nn.Module,
+    key_transform: nn.Module,
+    value_transform: nn.Module,
+    *,
+    num_heads: int,
+    head_dim: int,
+    value_head_dim: int | None = None,
+) -> None:
+    """Attach K/V transforms where attention inputs flatten heads and features."""
+    adapter = FlattenedAttentionKeyValueHeadTransform(
+        key_transform,
+        value_transform,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        value_head_dim=value_head_dim,
+    )
+    _set_attention_key_value_adapter(attention, adapter)
+
+
+def _set_attention_key_value_adapter(attention: nn.Module, adapter: nn.Module) -> None:
     if hasattr(attention, "_modelopt_key_value_head_transform"):
         attention._modelopt_key_value_head_transform = adapter
         return
@@ -137,7 +212,9 @@ class LinearOutputHeadTransform(nn.Module):
         """Apply the transform with heads moved to its leading tensor axis."""
         expected = self.num_heads * self.head_dim
         if output.shape[-1] != expected:
-            raise ValueError(f"expected a final dimension of {expected}, got {output.shape[-1]}")
+            raise ValueError(
+                f"expected a final dimension of {expected}, got {output.shape[-1]}"
+            )
         per_head = output.unflatten(-1, (self.num_heads, self.head_dim))
         transformed = self.transform(per_head.movedim(-2, 0)).movedim(0, -2)
         if transformed.shape != per_head.shape:
