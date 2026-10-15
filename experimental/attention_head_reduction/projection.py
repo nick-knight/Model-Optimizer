@@ -517,6 +517,36 @@ def _symmetric_matrix_from_eigendecomposition(eigenvectors: Tensor, eigenvalues:
     return (eigenvectors * eigenvalues.unsqueeze(-2)) @ eigenvectors.transpose(-1, -2)
 
 
+class _FrozenHeadProjection(torch.autograd.Function):
+    """Project through immutable bases without registering them as saved tensors.
+
+    Megatron's local CUDA-graph manager reuses buffers between forward and
+    backward capture. Generic einsum autograd saves the frozen transposed bases
+    and then rejects their capture-time version update. The bases are persistent
+    module buffers, so keeping references on the context is sufficient; only the
+    activation has a gradient.
+    """
+
+    @staticmethod
+    def forward(ctx, values: Tensor, projection: Tensor, reconstruction: Tensor) -> Tensor:
+        """Apply compression and reconstruction with the head axis leading."""
+        ctx.projection = projection
+        ctx.reconstruction = reconstruction
+        compressed = torch.einsum("h...d,hdr->h...r", values, projection)
+        return torch.einsum("h...r,hdr->h...d", compressed, reconstruction)
+
+    @staticmethod
+    def backward(ctx, gradient: Tensor) -> tuple[Tensor, None, None]:
+        """Propagate activation gradients through the fixed linear map."""
+        compressed_gradient = torch.einsum(
+            "h...d,hdr->h...r", gradient, ctx.reconstruction
+        )
+        values_gradient = torch.einsum(
+            "h...r,hdr->h...d", compressed_gradient, ctx.projection
+        )
+        return values_gradient, None, None
+
+
 class HeadProjector(nn.Module):
     """Emulate independently ranked per-head compression using frozen bases."""
 
@@ -645,7 +675,15 @@ class HeadProjector(nn.Module):
 
     def forward(self, values: Tensor, *, head_axis: int = 0) -> Tensor:
         """Apply projection followed by reconstruction to emulate compression."""
-        return self.reconstruct(self.compress(values, head_axis=head_axis), head_axis=head_axis)
+        values, original_head_axis = self._move_head_axis(values, head_axis)
+        projection = self.projection.to(values)
+        reconstruction = self._buffers.get("reconstruction")
+        if reconstruction is None:
+            reconstruction = self.projection
+        projected = _FrozenHeadProjection.apply(
+            values, projection, reconstruction.to(values)
+        )
+        return projected.movedim(0, original_head_axis)
 
     def _move_head_axis(self, values: Tensor, head_axis: int) -> tuple[Tensor, int]:
         if values.ndim < 2:

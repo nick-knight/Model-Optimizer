@@ -10,9 +10,7 @@ import torch
 from torch import nn
 from vllm.model_executor.layers.attention import Attention
 
-from experimental.attention_head_reduction.plugins.vllm import (
-    install_vllm_head_reduction,
-)
+from experimental.attention_head_reduction.plugins.vllm import install_vllm_head_reduction
 
 
 class _Layer(nn.Module):
@@ -39,11 +37,11 @@ def _bare_attention():
     return attention
 
 
-def _runner(attention, *, prefix_caching=False):
+def _runner(attention, *, prefix_caching=False, enforce_eager=False):
     return SimpleNamespace(
         model=_Model(attention),
         vllm_config=SimpleNamespace(
-            model_config=SimpleNamespace(enforce_eager=True),
+            model_config=SimpleNamespace(enforce_eager=enforce_eager),
             cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
             speculative_config=None,
         ),
@@ -89,7 +87,7 @@ def test_installer_selects_the_local_tp_head_and_hooks_before_cache_write(tmp_pa
     torch.testing.assert_close(value, torch.tensor([[1.0, 0.0, 0.0]]))
     assert report.installed_layers == ("layers.5.attn",)
     assert report.kv_cache_retention == pytest.approx(1 / 3)
-    assert len(attention._forward_pre_hooks) == 1
+    assert len(attention._forward_pre_hooks) == 0
 
 
 def test_installer_rejects_prefix_caching_before_mutating_the_model(tmp_path):

@@ -155,6 +155,7 @@ def megatron_prefill(
     packed_seq_params=None,
     skip_return_logits: bool = False,
     detach_output: bool = True,
+    record_cuda_graphs: bool = False,
 ) -> torch.Tensor:
     """A simple prefill function for Megatron Core V(LM) models.
 
@@ -169,12 +170,18 @@ def megatron_prefill(
     flattened batch of independently attended variable-length sequences. Packed callers must pass
     reset ``position_ids`` and pre-align the total token count for sequence parallelism. Set
     ``detach_output=False`` only for calibration procedures that explicitly back-propagate logits;
-    generation and evaluation callers should retain the default.
+    generation and evaluation callers should retain the default. Set
+    ``record_cuda_graphs=True`` only while a caller explicitly records Megatron local CUDA graphs;
+    this switches modules to training mode so their graph managers observe the call, without
+    changing gradient mode.
     """
     if not isinstance(model, MegatronModule):
         raise ValueError("megatron_prefill only supports Megatron Core models.")
 
-    model.eval()
+    if record_cuda_graphs:
+        model.train()
+    else:
+        model.eval()
 
     batch_size = input_ids.shape[0]
     seq_length = input_ids.shape[-1]

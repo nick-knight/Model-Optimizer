@@ -96,6 +96,35 @@ def test_projector_is_frozen_but_preserves_input_gradients():
     assert projector.state_dict().keys() == {"projection", "ranks"}
 
 
+def test_projector_custom_backward_matches_explicit_oblique_projection():
+    """Graph-safe backward should equal autograd through the two explicit products."""
+    generator = torch.Generator().manual_seed(123)
+    basis = torch.randn(2, 4, 4, generator=generator, dtype=torch.float64)
+    reconstruction = torch.randn(2, 4, 4, generator=generator, dtype=torch.float64)
+    projector = HeadProjector(
+        basis,
+        ranks=[2, 3],
+        reconstruction_basis=reconstruction,
+    )
+    values = torch.randn(
+        2, 5, 4, generator=generator, dtype=torch.float64, requires_grad=True
+    )
+    expected_values = values.detach().clone().requires_grad_()
+    output_gradient = torch.randn(2, 5, 4, generator=generator, dtype=torch.float64)
+
+    projector(values).backward(output_gradient)
+    explicit = torch.einsum(
+        "h...r,hdr->h...d",
+        torch.einsum(
+            "h...d,hdr->h...r", expected_values, projector.projection
+        ),
+        projector.reconstruction,
+    )
+    explicit.backward(output_gradient)
+
+    torch.testing.assert_close(values.grad, expected_values.grad)
+
+
 def test_activation_gradient_calibration_accumulates_local_second_moments():
     """Calibration should independently flatten positions in both forward and backward."""
     values = torch.tensor(

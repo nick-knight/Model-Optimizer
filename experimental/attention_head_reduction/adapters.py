@@ -15,6 +15,8 @@
 
 """Adapters for applying per-head transforms at attention boundaries."""
 
+from types import MethodType
+
 from torch import Tensor, nn
 
 __all__ = [
@@ -96,12 +98,33 @@ def _apply_attention_key_value_transforms(
     return tuple(mutable_inputs), kwargs
 
 
+def _forward_with_attention_key_value_transforms(
+    module: nn.Module,
+    *inputs: Tensor,
+    **kwargs,
+):
+    """Apply registered transforms without a Python forward hook.
+
+    Megatron's local CUDA-graph implementation deliberately rejects user forward
+    pre-hooks inside a captured module. Keeping the adapter as an ordinary child
+    module in the forward call also makes it visible to ``torch.compile`` users
+    such as vLLM.
+    """
+    transformed_inputs, transformed_kwargs = _apply_attention_key_value_transforms(
+        module, inputs, kwargs
+    )
+    return module._modelopt_untransformed_forward(
+        *transformed_inputs, **transformed_kwargs
+    )
+
+
 def set_attention_key_value_transforms(
     attention: nn.Module,
     key_transform: nn.Module,
     value_transform: nn.Module,
     *,
     head_axis: int = -2,
+    use_forward_pre_hook: bool = False,
 ) -> None:
     """Attach or replace persistent K/V transforms at an explicit-QKV attention boundary.
 
@@ -114,7 +137,9 @@ def set_attention_key_value_transforms(
         value_transform,
         head_axis=head_axis,
     )
-    _set_attention_key_value_adapter(attention, adapter)
+    _set_attention_key_value_adapter(
+        attention, adapter, use_forward_pre_hook=use_forward_pre_hook
+    )
 
 
 class FlattenedAttentionKeyValueHeadTransform(nn.Module):
@@ -129,6 +154,7 @@ class FlattenedAttentionKeyValueHeadTransform(nn.Module):
         head_dim: int,
         value_head_dim: int | None = None,
     ) -> None:
+        """Initialize transforms for flattened K/V head layouts."""
         super().__init__()
         if num_heads < 1 or head_dim < 1:
             raise ValueError("num_heads and head_dim must be positive")
@@ -172,6 +198,7 @@ def set_flattened_attention_key_value_transforms(
     num_heads: int,
     head_dim: int,
     value_head_dim: int | None = None,
+    use_forward_pre_hook: bool = False,
 ) -> None:
     """Attach K/V transforms where attention inputs flatten heads and features."""
     adapter = FlattenedAttentionKeyValueHeadTransform(
@@ -181,19 +208,42 @@ def set_flattened_attention_key_value_transforms(
         head_dim=head_dim,
         value_head_dim=value_head_dim,
     )
-    _set_attention_key_value_adapter(attention, adapter)
+    _set_attention_key_value_adapter(
+        attention, adapter, use_forward_pre_hook=use_forward_pre_hook
+    )
 
 
-def _set_attention_key_value_adapter(attention: nn.Module, adapter: nn.Module) -> None:
+def _set_attention_key_value_adapter(
+    attention: nn.Module,
+    adapter: nn.Module,
+    *,
+    use_forward_pre_hook: bool,
+) -> None:
     if hasattr(attention, "_modelopt_key_value_head_transform"):
+        installed_with_hook = hasattr(
+            attention, "_modelopt_key_value_head_transform_handle"
+        )
+        if installed_with_hook != use_forward_pre_hook:
+            raise ValueError(
+                "cannot change the attention transform integration mode after installation"
+            )
         attention._modelopt_key_value_head_transform = adapter
         return
     attention.add_module("_modelopt_key_value_head_transform", adapter)
-    handle = attention.register_forward_pre_hook(
-        _apply_attention_key_value_transforms,
-        with_kwargs=True,
+    if use_forward_pre_hook:
+        handle = attention.register_forward_pre_hook(
+            _apply_attention_key_value_transforms,
+            with_kwargs=True,
+        )
+        object.__setattr__(attention, "_modelopt_key_value_head_transform_handle", handle)
+        return
+
+    object.__setattr__(
+        attention, "_modelopt_untransformed_forward", attention.forward
     )
-    object.__setattr__(attention, "_modelopt_key_value_head_transform_handle", handle)
+    attention.forward = MethodType(
+        _forward_with_attention_key_value_transforms, attention
+    )
 
 
 class LinearOutputHeadTransform(nn.Module):

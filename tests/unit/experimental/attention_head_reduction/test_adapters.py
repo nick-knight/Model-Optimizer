@@ -69,8 +69,8 @@ def test_attention_transform_applies_to_explicit_key_and_value_heads():
     }
 
 
-def test_setting_attention_transform_twice_does_not_stack_forward_hooks():
-    """Replacing attention calibration with projection should retain one pre-hook."""
+def test_setting_attention_transform_twice_does_not_stack_forward_wrappers():
+    """Replacing attention calibration with projection should retain one wrapper."""
     attention = ExplicitQKVAttention()
     set_attention_key_value_transforms(attention, nn.Identity(), nn.Identity())
     basis = torch.eye(2).expand(2, -1, -1)
@@ -81,7 +81,10 @@ def test_setting_attention_transform_twice_does_not_stack_forward_hooks():
         HeadProjector(basis, ranks=[1, 1]),
     )
 
-    assert len(attention._forward_pre_hooks) == 1
+    assert len(attention._forward_pre_hooks) == 0
+    assert attention.forward.__func__.__name__ == (
+        "_forward_with_attention_key_value_transforms"
+    )
     values = torch.ones(1, 1, 2, 2)
     _, key, value = attention(values, values, values)
     torch.testing.assert_close(key, torch.tensor([[[[1.0, 0.0], [1.0, 0.0]]]]))
@@ -125,6 +128,53 @@ def test_flattened_attention_transform_rejects_an_incompatible_layout():
 
     with pytest.raises(ValueError, match="final dimension of 6"):
         attention(torch.ones(2, 5), torch.ones(2, 5), torch.ones(2, 5))
+
+
+def test_attention_transform_can_use_a_pre_hook_for_stateful_calibration():
+    attention = ExplicitQKVAttention()
+    set_attention_key_value_transforms(
+        attention,
+        nn.Identity(),
+        nn.Identity(),
+        use_forward_pre_hook=True,
+    )
+
+    assert len(attention._forward_pre_hooks) == 1
+    values = torch.ones(1, 1, 2, 2)
+    _, key, value = attention(values, values, values)
+    torch.testing.assert_close(key, values)
+    torch.testing.assert_close(value, values)
+
+
+def test_attention_transform_integration_mode_cannot_change_after_installation():
+    attention = ExplicitQKVAttention()
+    set_attention_key_value_transforms(attention, nn.Identity(), nn.Identity())
+
+    with pytest.raises(ValueError, match="integration mode"):
+        set_attention_key_value_transforms(
+            attention,
+            nn.Identity(),
+            nn.Identity(),
+            use_forward_pre_hook=True,
+        )
+
+
+def test_attention_transform_is_visible_to_torch_compile_full_graph():
+    attention = ExplicitQKVAttention()
+    basis = torch.eye(2).expand(2, -1, -1)
+    set_attention_key_value_transforms(
+        attention,
+        HeadProjector(basis, ranks=[1, 1]),
+        HeadProjector(basis, ranks=[1, 1]),
+    )
+    values = torch.ones(1, 1, 2, 2)
+
+    compiled = torch.compile(attention, backend="eager", fullgraph=True)
+    _, key, value = compiled(values, values, values)
+
+    expected = torch.tensor([[[[1.0, 0.0], [1.0, 0.0]]]])
+    torch.testing.assert_close(key, expected)
+    torch.testing.assert_close(value, expected)
 
 
 def test_linear_output_transform_applies_independently_per_head():

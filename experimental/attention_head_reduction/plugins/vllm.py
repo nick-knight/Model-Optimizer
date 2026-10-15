@@ -10,20 +10,19 @@ import importlib
 import json
 import re
 from collections import defaultdict
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import Tensor, nn
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
+from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 
 from ..adapters import set_flattened_attention_key_value_transforms
 from ..projection import HeadProjector
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 __all__ = ["VllmHeadReductionInstallReport", "install_vllm_head_reduction"]
 
@@ -217,8 +216,6 @@ def _validate_runtime(model_runner) -> None:
     cache_config = getattr(config, "cache_config", None)
     if model_config is None or cache_config is None:
         raise RuntimeError("vLLM model and cache configs are required")
-    if getattr(model_config, "enforce_eager", None) is False:
-        raise NotImplementedError("head-reduction emulation requires --enforce-eager")
     if getattr(cache_config, "enable_prefix_caching", False):
         raise NotImplementedError(
             "head-reduction emulation has not validated prefix caching"
